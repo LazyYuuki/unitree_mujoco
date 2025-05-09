@@ -26,7 +26,6 @@
 #include <thread>
 #include <vector> // Required for std::vector used in ElasticBand
 
-#include "mujoco/array_safety.h"
 #include "unitree_sdk2_bridge/unitree_sdk2_bridge.h" // Assuming this header is correct
 #include "yaml-cpp/yaml.h"
 #include <mujoco/mujoco.h>
@@ -408,8 +407,7 @@ void PhysicsThread(const char *filename_arg) {
   const char *effective_filename = filename_arg;
 
   if (filename_arg == nullptr || filename_arg[0] == '\0') {
-    scene_path_str =
-        "../../unitree_robots/" + config.robot + "/" + config.robot_scene;
+    scene_path_str = "../../" + config.robot + "/" + config.robot_scene;
     effective_filename = scene_path_str.c_str();
     std::cout << "No filename provided via argument, using from config: "
               << effective_filename << std::endl;
