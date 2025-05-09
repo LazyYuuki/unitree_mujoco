@@ -26,6 +26,7 @@
 #include <thread>
 #include <vector> // Required for std::vector used in ElasticBand
 
+#include "mujoco/array_safety.h"
 #include "unitree_sdk2_bridge/unitree_sdk2_bridge.h" // Assuming this header is correct
 #include "yaml-cpp/yaml.h"
 #include <mujoco/mujoco.h>
