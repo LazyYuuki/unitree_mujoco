@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <atomic> // Required for std::atomic
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -23,19 +24,17 @@
 #include <new>
 #include <string>
 #include <thread>
+#include <vector> // Required for std::vector used in ElasticBand
 
-#include <mujoco/mujoco.h>
-#include "mujoco/glfw_adapter.h"
-#include "mujoco/simulate.h"
 #include "mujoco/array_safety.h"
-#include "unitree_sdk2_bridge/unitree_sdk2_bridge.h"
-#include <pthread.h>
+#include "unitree_sdk2_bridge/unitree_sdk2_bridge.h" // Assuming this header is correct
 #include "yaml-cpp/yaml.h"
+#include <mujoco/mujoco.h>
+#include <pthread.h>
 
 #define MUJOCO_PLUGIN_DIR "mujoco_plugin"
 
-extern "C"
-{
+extern "C" {
 #if defined(_WIN32) || defined(__CYGWIN__)
 #include <windows.h>
 #else
@@ -47,640 +46,612 @@ extern "C"
 #endif
 }
 
-namespace
-{
-  namespace mj = ::mujoco;
-  namespace mju = ::mujoco::sample_util;
+namespace {
+namespace mj = ::mujoco;
+namespace mju = ::mujoco::sample_util;
 
-  // constants
-  const double syncMisalign = 0.1;       // maximum mis-alignment before re-sync (simulation seconds)
-  const double simRefreshFraction = 0.7; // fraction of refresh available for simulation
-  const int kErrorLength = 1024;         // load error string length
+const int kErrorLength = 1024; // load error string length
 
-  // model and data
-  mjModel *m = nullptr;
-  mjData *d = nullptr;
+// model and data
+mjModel *m = nullptr;
+mjData *d = nullptr;
 
-  // control noise variables
-  mjtNum *ctrlnoise = nullptr;
+// control noise variables
+mjtNum *ctrlnoise = nullptr;
 
-  struct SimulationConfig
-  {
-    std::string robot = "go2";
-    std::string robot_scene = "scene.xml";
+std::atomic<bool> exit_request = false; // Global flag to signal exit
 
-    int domain_id = 1;
-    std::string interface = "lo";
+struct SimulationConfig {
+  std::string robot = "go2";
+  std::string robot_scene = "scene.xml";
 
-    int use_joystick = 0;
-    std::string joystick_type = "xbox";
-    std::string joystick_device = "/dev/input/js0";
-    int joystick_bits = 16;
+  int domain_id = 1;
+  std::string interface = "lo";
 
-    int print_scene_information = 1;
+  int use_joystick = 0;
+  std::string joystick_type = "xbox";
+  std::string joystick_device = "/dev/input/js0";
+  int joystick_bits = 16;
 
-    int enable_elastic_band = 0;
-    int band_attached_link = 0;
+  int print_scene_information = 1;
 
-  } config;
+  int enable_elastic_band = 0;
+  // int band_attached_link = 0; // This will be determined by name now
 
-  using Seconds = std::chrono::duration<double>;
+  double ctrl_noise_std = 0.0;
+  double ctrl_noise_rate = 0.1;
+} config;
 
-  //---------------------------------------- plugin handling -----------------------------------------
+namespace headless_sim {
+struct ElasticBand {
+  bool enable_ = false;
+  double f_[3] = {0.0, 0.0, 0.0};
+  double k_stiffness_ = 100.0;
+  double x0_equilibrium_[3] = {0.0, 0.0, 0.0};
+  double damping_coeff_ = 10.0;
+  int attached_body_id_ = -1; // Store the body ID for the elastic band
 
-  // return the path to the directory containing the current executable
-  // used to determine the location of auto-loaded plugin libraries
-  std::string getExecutableDir()
-  {
-#if defined(_WIN32) || defined(__CYGWIN__)
-    constexpr char kPathSep = '\\';
-    std::string realpath = [&]() -> std::string
-    {
-      std::unique_ptr<char[]> realpath(nullptr);
-      DWORD buf_size = 128;
-      bool success = false;
-      while (!success)
-      {
-        realpath.reset(new (std::nothrow) char[buf_size]);
-        if (!realpath)
-        {
-          std::cerr << "cannot allocate memory to store executable path\n";
-          return "";
-        }
+  void Init(bool enabled, double stiffness, const double equilibrium[3],
+            double damping, mjModel *model, const std::string &body_name) {
+    enable_ = enabled;
+    if (!enable_)
+      return;
 
-        DWORD written = GetModuleFileNameA(nullptr, realpath.get(), buf_size);
-        if (written < buf_size)
-        {
-          success = true;
-        }
-        else if (written == buf_size)
-        {
-          // realpath is too small, grow and retry
-          buf_size *= 2;
-        }
-        else
-        {
-          std::cerr << "failed to retrieve executable path: " << GetLastError() << "\n";
-          return "";
-        }
+    k_stiffness_ = stiffness;
+    x0_equilibrium_[0] = equilibrium[0];
+    x0_equilibrium_[1] = equilibrium[1];
+    x0_equilibrium_[2] = equilibrium[2];
+    damping_coeff_ = damping;
+
+    if (model && !body_name.empty()) {
+      attached_body_id_ = mj_name2id(model, mjOBJ_BODY, body_name.c_str());
+      if (attached_body_id_ == -1) {
+        std::cerr << "ElasticBand Warning: Could not find body named '"
+                  << body_name << "'" << std::endl;
+        enable_ = false; // Disable if body not found
+      } else {
+        std::cout << "ElasticBand initialized for body '" << body_name
+                  << "' (ID: " << attached_body_id_ << ")" << std::endl;
       }
-      return realpath.get();
-    }();
-#else
-    constexpr char kPathSep = '/';
-#if defined(__APPLE__)
-    std::unique_ptr<char[]> buf(nullptr);
-    {
-      std::uint32_t buf_size = 0;
-      _NSGetExecutablePath(nullptr, &buf_size);
-      buf.reset(new char[buf_size]);
-      if (!buf)
-      {
-        std::cerr << "cannot allocate memory to store executable path\n";
-        return "";
-      }
-      if (_NSGetExecutablePath(buf.get(), &buf_size))
-      {
-        std::cerr << "unexpected error from _NSGetExecutablePath\n";
-      }
+    } else {
+      enable_ = false; // Disable if model or body name is missing
+      std::cerr << "ElasticBand Warning: Model or body name not provided for "
+                   "initialization."
+                << std::endl;
     }
-    const char *path = buf.get();
-#else
-    const char *path = "/proc/self/exe";
-#endif
-    std::string realpath = [&]() -> std::string
-    {
-      std::unique_ptr<char[]> realpath(nullptr);
-      std::uint32_t buf_size = 128;
-      bool success = false;
-      while (!success)
-      {
-        realpath.reset(new (std::nothrow) char[buf_size]);
-        if (!realpath)
-        {
-          std::cerr << "cannot allocate memory to store executable path\n";
-          return "";
-        }
-
-        std::size_t written = readlink(path, realpath.get(), buf_size);
-        if (written < buf_size)
-        {
-          realpath.get()[written] = '\0';
-          success = true;
-        }
-        else if (written == -1)
-        {
-          if (errno == EINVAL)
-          {
-            // path is already not a symlink, just use it
-            return path;
-          }
-
-          std::cerr << "error while resolving executable path: " << strerror(errno) << '\n';
-          return "";
-        }
-        else
-        {
-          // realpath is too small, grow and retry
-          buf_size *= 2;
-        }
-      }
-      return realpath.get();
-    }();
-#endif
-
-    if (realpath.empty())
-    {
-      return "";
-    }
-
-    for (std::size_t i = realpath.size() - 1; i > 0; --i)
-    {
-      if (realpath.c_str()[i] == kPathSep)
-      {
-        return realpath.substr(0, i);
-      }
-    }
-
-    // don't scan through the entire file system's root
-    return "";
   }
 
-  // scan for libraries in the plugin directory to load additional plugins
-  void scanPluginLibraries()
-  {
-    // check and print plugins that are linked directly into the executable
-    int nplugin = mjp_pluginCount();
-    if (nplugin)
-    {
-      std::printf("Built-in plugins:\n");
-      for (int i = 0; i < nplugin; ++i)
-      {
-        std::printf("    %s\n", mjp_getPluginAtSlot(i)->name);
-      }
-    }
-
-    // define platform-specific strings
-#if defined(_WIN32) || defined(__CYGWIN__)
-    const std::string sep = "\\";
-#else
-    const std::string sep = "/";
-#endif
-
-    // try to open the ${EXECDIR}/plugin directory
-    // ${EXECDIR} is the directory containing the simulate binary itself
-    const std::string executable_dir = getExecutableDir();
-    if (executable_dir.empty())
-    {
+  void Advance(const mjData *data_ptr) { // Pass mjData to get body pose
+    if (!enable_ || attached_body_id_ == -1 || !data_ptr) {
+      f_[0] = f_[1] = f_[2] = 0.0;
       return;
     }
 
-    const std::string plugin_dir = getExecutableDir() + sep + MUJOCO_PLUGIN_DIR;
-    mj_loadAllPluginLibraries(
-        plugin_dir.c_str(), +[](const char *filename, int first, int count)
-                            {
+    // Get current position and velocity of the attached body's CoM in world
+    // frame xpos is [body_id * 3 + (0,1,2)] cvel is [body_id * 6 + (3,4,5 for
+    // linear vel)]
+    std::vector<double> x_current(3), dx_current(3);
+    for (int i = 0; i < 3; ++i) {
+      x_current[i] =
+          data_ptr->xipos[attached_body_id_ * 3 + i]; // Center of mass position
+      dx_current[i] =
+          data_ptr
+              ->cvel[attached_body_id_ * 6 + (3 + i)]; // Linear velocity of CoM
+    }
+
+    // Simplified spring-damper logic
+    for (int i = 0; i < 3; ++i) {
+      f_[i] = -k_stiffness_ * (x_current[i] - x0_equilibrium_[i]) -
+              damping_coeff_ * dx_current[i];
+    }
+  }
+
+  void ApplyForce(mjData *data_ptr) {
+    if (!enable_ || attached_body_id_ == -1 || !data_ptr) {
+      return;
+    }
+    // Apply calculated force to the center of mass of the attached body
+    // xfrc_applied is [body_id * 6 + (0,1,2 for force)]
+    for (int i = 0; i < 3; ++i) {
+      data_ptr->xfrc_applied[attached_body_id_ * 6 + i] +=
+          f_[i]; // Add force, allows other forces
+    }
+    // Torque is not applied by this simple band
+  }
+};
+ElasticBand elastic_band_instance;
+} // namespace headless_sim
+
+using Seconds = std::chrono::duration<double>;
+
+std::string getExecutableDir() {
+#if defined(_WIN32) || defined(__CYGWIN__)
+  constexpr char kPathSep = '\\';
+  std::string realpath_str = [&]() -> std::string {
+    std::unique_ptr<char[]> realpath_ptr(nullptr);
+    DWORD buf_size = 128;
+    bool success = false;
+    while (!success) {
+      realpath_ptr.reset(new (std::nothrow) char[buf_size]);
+      if (!realpath_ptr) {
+        std::cerr << "cannot allocate memory to store executable path\n";
+        return "";
+      }
+
+      DWORD written = GetModuleFileNameA(nullptr, realpath_ptr.get(), buf_size);
+      if (written < buf_size) {
+        success = true;
+      } else if (written == buf_size) {
+        buf_size *= 2;
+      } else {
+        std::cerr << "failed to retrieve executable path: " << GetLastError()
+                  << "\n";
+        return "";
+      }
+    }
+    return realpath_ptr.get();
+  }();
+#else // Not Windows
+  constexpr char kPathSep = '/';
+  const char *path_for_readlink; // Will point to the path to be resolved
+
+#if defined(__APPLE__)
+  std::unique_ptr<char[]> buf(
+      nullptr); // Needs to stay in scope for path_for_readlink
+  {
+    std::uint32_t temp_buf_size = 0;
+    _NSGetExecutablePath(nullptr, &temp_buf_size);
+    buf.reset(new char[temp_buf_size]);
+    if (!buf) {
+      std::cerr << "cannot allocate memory to store executable path (Apple)\n";
+      return "";
+    }
+    if (_NSGetExecutablePath(buf.get(), &temp_buf_size) != 0) // 0 on success
+    {
+      // This case should ideally not happen if pre-flighting temp_buf_size
+      // worked.
+      std::cerr
+          << "unexpected error from _NSGetExecutablePath or buffer too small\n";
+      // return ""; // Or try to proceed if path is partially written, though
+      // risky.
+    }
+  }
+  path_for_readlink = buf.get();
+#else // Not Apple (e.g., Linux)
+  path_for_readlink = "/proc/self/exe";
+#endif
+
+  std::string realpath_str = [&]() -> std::string {
+    std::unique_ptr<char[]> realpath_ptr(nullptr);
+    std::uint32_t current_buf_size = 128; // Initial buffer size for readlink
+    bool success = false;
+    while (!success) {
+      realpath_ptr.reset(new (std::nothrow) char[current_buf_size]);
+      if (!realpath_ptr) {
+        std::cerr
+            << "cannot allocate memory to store executable path (readlink)\n";
+        return "";
+      }
+
+      std::size_t written =
+          readlink(path_for_readlink, realpath_ptr.get(), current_buf_size);
+
+      if (written < current_buf_size) // Success, including case where written
+                                      // == -1 (error)
+      {
+        if (written == static_cast<std::size_t>(-1)) // readlink error
+        {
+#if defined(__APPLE__)
+          // On macOS, if path_for_readlink was from _NSGetExecutablePath,
+          // it's already resolved. readlink might fail with EINVAL if it's not
+          // a symlink.
+          if (errno == EINVAL) {
+            return path_for_readlink; // Use the path from _NSGetExecutablePath
+                                      // directly
+          }
+#endif
+          // General readlink error
+          std::cerr << "error while resolving executable path with readlink: "
+                    << strerror(errno) << '\n';
+          return "";
+        }
+        // readlink success
+        realpath_ptr.get()[written] = '\0'; // Null-terminate
+        success = true;
+      } else // Buffer too small (written == current_buf_size)
+      {
+        current_buf_size *= 2;
+      }
+    }
+    return realpath_ptr.get();
+  }();
+#endif // End OS-specific path gathering
+
+  if (realpath_str.empty()) {
+    return "";
+  }
+
+  // Find the last path separator
+  std::size_t last_sep = realpath_str.rfind(kPathSep);
+  if (last_sep != std::string::npos) {
+    return realpath_str.substr(0, last_sep);
+  }
+
+  // If no separator found, it might be a file in the current dir or root.
+  // This behavior might need adjustment based on expectations.
+  return ""; // Or return "." for current directory if appropriate
+}
+
+void scanPluginLibraries() {
+  int nplugin = mjp_pluginCount();
+  if (nplugin) {
+    std::printf("Built-in plugins:\n");
+    for (int i = 0; i < nplugin; ++i) {
+      std::printf("    %s\n", mjp_getPluginAtSlot(i)->name);
+    }
+  }
+
+#if defined(_WIN32) || defined(__CYGWIN__)
+  const std::string sep = "\\";
+#else
+  const std::string sep = "/";
+#endif
+
+  const std::string executable_dir = getExecutableDir();
+  if (executable_dir.empty()) {
+    std::cerr << "Warning: Could not determine executable directory. Plugin "
+                 "scanning might fail."
+              << std::endl;
+    return;
+  }
+
+  const std::string plugin_dir = executable_dir + sep + MUJOCO_PLUGIN_DIR;
+  mj_loadAllPluginLibraries(
+      plugin_dir.c_str(), +[](const char *filename, int first, int count) {
         std::printf("Plugins registered by library '%s':\n", filename);
         for (int i = first; i < first + count; ++i) {
           std::printf("    %s\n", mjp_getPluginAtSlot(i)->name);
-        } });
-  }
-
-  //------------------------------------------- simulation -------------------------------------------
-
-  mjModel *LoadModel(const char *file, mj::Simulate &sim)
-  {
-    // this copy is needed so that the mju::strlen call below compiles
-    char filename[mj::Simulate::kMaxFilenameLength];
-    mju::strcpy_arr(filename, file);
-
-    // make sure filename is not empty
-    if (!filename[0])
-    {
-      return nullptr;
-    }
-
-    // load and compile
-    char loadError[kErrorLength] = "";
-    mjModel *mnew = 0;
-    if (mju::strlen_arr(filename) > 4 &&
-        !std::strncmp(filename + mju::strlen_arr(filename) - 4, ".mjb",
-                      mju::sizeof_arr(filename) - mju::strlen_arr(filename) + 4))
-    {
-      mnew = mj_loadModel(filename, nullptr);
-      if (!mnew)
-      {
-        mju::strcpy_arr(loadError, "could not load binary model");
-      }
-    }
-    else
-    {
-      mnew = mj_loadXML(filename, nullptr, loadError, kErrorLength);
-      // remove trailing newline character from loadError
-      if (loadError[0])
-      {
-        int error_length = mju::strlen_arr(loadError);
-        if (loadError[error_length - 1] == '\n')
-        {
-          loadError[error_length - 1] = '\0';
         }
-      }
-    }
-
-    mju::strcpy_arr(sim.load_error, loadError);
-
-    if (!mnew)
-    {
-      std::printf("%s\n", loadError);
-      return nullptr;
-    }
-
-    // compiler warning: print and pause
-    if (loadError[0])
-    {
-      // mj_forward() below will print the warning message
-      std::printf("Model compiled, but simulation warning (paused):\n  %s\n", loadError);
-      sim.run = 0;
-    }
-
-    return mnew;
-  }
-
-  // simulate in background thread (while rendering in main thread)
-  void PhysicsLoop(mj::Simulate &sim)
-  {
-    // cpu-sim syncronization point
-    std::chrono::time_point<mj::Simulate::Clock> syncCPU;
-    mjtNum syncSim = 0;
-
-    // ChannelFactory::Instance()->Init(0);
-    // UnitreeDds ud(d);
-
-    // run until asked to exit
-    while (!sim.exitrequest.load())
-    {
-      if (sim.droploadrequest.load())
-      {
-        sim.LoadMessage(sim.dropfilename);
-        mjModel *mnew = LoadModel(sim.dropfilename, sim);
-        sim.droploadrequest.store(false);
-
-        mjData *dnew = nullptr;
-        if (mnew)
-          dnew = mj_makeData(mnew);
-        if (dnew)
-        {
-          sim.Load(mnew, dnew, sim.dropfilename);
-
-          mj_deleteData(d);
-          mj_deleteModel(m);
-
-          m = mnew;
-          d = dnew;
-          mj_forward(m, d);
-
-          // allocate ctrlnoise
-          free(ctrlnoise);
-          ctrlnoise = (mjtNum *)malloc(sizeof(mjtNum) * m->nu);
-          mju_zero(ctrlnoise, m->nu);
-        }
-        else
-        {
-          sim.LoadMessageClear();
-        }
-      }
-
-      if (sim.uiloadrequest.load())
-      {
-        sim.uiloadrequest.fetch_sub(1);
-        sim.LoadMessage(sim.filename);
-        mjModel *mnew = LoadModel(sim.filename, sim);
-        mjData *dnew = nullptr;
-        if (mnew)
-          dnew = mj_makeData(mnew);
-        if (dnew)
-        {
-          sim.Load(mnew, dnew, sim.filename);
-
-          mj_deleteData(d);
-          mj_deleteModel(m);
-
-          m = mnew;
-          d = dnew;
-          mj_forward(m, d);
-
-          // allocate ctrlnoise
-          free(ctrlnoise);
-          ctrlnoise = static_cast<mjtNum *>(malloc(sizeof(mjtNum) * m->nu));
-          mju_zero(ctrlnoise, m->nu);
-        }
-        else
-        {
-          sim.LoadMessageClear();
-        }
-      }
-
-      // sleep for 1 ms or yield, to let main thread run
-      //  yield results in busy wait - which has better timing but kills battery life
-      if (sim.run && sim.busywait)
-      {
-        std::this_thread::yield();
-      }
-      else
-      {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      }
-
-      {
-        // lock the sim mutex
-        const std::unique_lock<std::recursive_mutex> lock(sim.mtx);
-
-        // run only if model is present
-        if (m)
-        {
-          // running
-          if (sim.run)
-          {
-            bool stepped = false;
-
-            // record cpu time at start of iteration
-            const auto startCPU = mj::Simulate::Clock::now();
-
-            // elapsed CPU and simulation time since last sync
-            const auto elapsedCPU = startCPU - syncCPU;
-            double elapsedSim = d->time - syncSim;
-
-            // inject noise
-            if (sim.ctrl_noise_std)
-            {
-              // convert rate and scale to discrete time (Ornstein–Uhlenbeck)
-              mjtNum rate = mju_exp(-m->opt.timestep / mju_max(sim.ctrl_noise_rate, mjMINVAL));
-              mjtNum scale = sim.ctrl_noise_std * mju_sqrt(1 - rate * rate);
-
-              for (int i = 0; i < m->nu; i++)
-              {
-                // update noise
-                ctrlnoise[i] = rate * ctrlnoise[i] + scale * mju_standardNormal(nullptr);
-
-                // apply noise
-                d->ctrl[i] = ctrlnoise[i];
-              }
-            }
-
-            // requested slow-down factor
-            double slowdown = 100 / sim.percentRealTime[sim.real_time_index];
-
-            // misalignment condition: distance from target sim time is bigger than syncmisalign
-            bool misaligned =
-                mju_abs(Seconds(elapsedCPU).count() / slowdown - elapsedSim) > syncMisalign;
-
-            // out-of-sync (for any reason): reset sync times, step
-            if (elapsedSim < 0 || elapsedCPU.count() < 0 || syncCPU.time_since_epoch().count() == 0 ||
-                misaligned || sim.speed_changed)
-            {
-              // re-sync
-              syncCPU = startCPU;
-              syncSim = d->time;
-              sim.speed_changed = false;
-
-              // run single step, let next iteration deal with timing
-              mj_step(m, d);
-              stepped = true;
-            }
-
-            // in-sync: step until ahead of cpu
-            else
-            {
-              bool measured = false;
-              mjtNum prevSim = d->time;
-
-              double refreshTime = simRefreshFraction / sim.refresh_rate;
-
-              // step while sim lags behind cpu and within refreshTime
-              while (Seconds((d->time - syncSim) * slowdown) < mj::Simulate::Clock::now() - syncCPU &&
-                     mj::Simulate::Clock::now() - startCPU < Seconds(refreshTime))
-              {
-                // measure slowdown before first step
-                if (!measured && elapsedSim)
-                {
-                  sim.measured_slowdown =
-                      std::chrono::duration<double>(elapsedCPU).count() / elapsedSim;
-                  measured = true;
-                }
-
-                // elastic band on base link
-                if (sim.use_elastic_band_ == 1)
-                {
-                  if (sim.elastic_band_.enable_)
-                  {
-                    vector<double> x = {d->qpos[0], d->qpos[1], d->qpos[2]};
-                    vector<double> dx = {d->qvel[0], d->qvel[1], d->qvel[2]};
-
-                    sim.elastic_band_.Advance(x, dx);
-
-                    d->xfrc_applied[config.band_attached_link] = sim.elastic_band_.f_[0];
-                    d->xfrc_applied[config.band_attached_link + 1] = sim.elastic_band_.f_[1];
-                    d->xfrc_applied[config.band_attached_link + 2] = sim.elastic_band_.f_[2];
-                  }
-                }
-
-                // call mj_step
-                mj_step(m, d);
-                stepped = true;
-
-                // break if reset
-                if (d->time < prevSim)
-                {
-                  break;
-                }
-              }
-            }
-
-            // save current state to history buffer
-            if (stepped)
-            {
-              sim.AddToHistory();
-            }
-          }
-
-          // paused
-          else
-          {
-            // run mj_forward, to update rendering and joint sliders
-            mj_forward(m, d);
-            sim.speed_changed = true;
-          }
-        }
-      } // release std::lock_guard<std::mutex>
-    }
-  }
-} // namespace
-
-//-------------------------------------- physics_thread --------------------------------------------
-
-void PhysicsThread(mj::Simulate *sim, const char *filename)
-{
-  // request loadmodel if file given (otherwise drag-and-drop)
-  if (filename != nullptr)
-  {
-    sim->LoadMessage(filename);
-    m = LoadModel(filename, *sim);
-    if (m)
-      d = mj_makeData(m);
-    if (d)
-    {
-      sim->Load(m, d, filename);
-      mj_forward(m, d);
-
-      // allocate ctrlnoise
-      free(ctrlnoise);
-      ctrlnoise = static_cast<mjtNum *>(malloc(sizeof(mjtNum) * m->nu));
-      mju_zero(ctrlnoise, m->nu);
-    }
-    else
-    {
-      sim->LoadMessageClear();
-    }
-  }
-
-  PhysicsLoop(*sim);
-
-  // delete everything we allocated
-  free(ctrlnoise);
-  mj_deleteData(d);
-  mj_deleteModel(m);
-
-  exit(0);
+      });
 }
 
-void *UnitreeSdk2BridgeThread(void *arg)
-{
-  // Wait for mujoco data
-  while (1)
-  {
-    if (d)
-    {
-      std::cout << "Mujoco data is prepared" << std::endl;
-      break;
-    }
-    usleep(500000);
+mjModel *LoadModel(const char *file) {
+  char filename_arr[1024];
+  mju::strcpy_arr(filename_arr, file);
+
+  if (!filename_arr[0]) {
+    std::cerr << "LoadModel error: Empty filename provided." << std::endl;
+    return nullptr;
   }
 
-  if (config.robot == "h1" || config.robot == "g1")
-  {
-    config.band_attached_link = 6 * mj_name2id(m, mjOBJ_BODY, "torso_link");
+  char loadError[kErrorLength] = "";
+  mjModel *mnew = nullptr;
+  if (mju::strlen_arr(filename_arr) > 4 &&
+      !std::strncmp(filename_arr + mju::strlen_arr(filename_arr) - 4, ".mjb",
+                    4)) {
+    mnew = mj_loadModel(filename_arr, nullptr);
+    if (!mnew) {
+      mju::strcpy_arr(loadError, "could not load binary model");
+    }
+  } else {
+    mnew = mj_loadXML(filename_arr, nullptr, loadError, kErrorLength);
+    if (loadError[0]) {
+      int error_length = mju::strlen_arr(loadError);
+      if (error_length > 0 && loadError[error_length - 1] == '\n') {
+        loadError[error_length - 1] = '\0';
+      }
+    }
   }
-  else
-  {
-    config.band_attached_link = 6 * mj_name2id(m, mjOBJ_BODY, "base_link");
+
+  if (!mnew) {
+    std::fprintf(stderr, "LoadModel error: %s (file: %s)\n", loadError,
+                 filename_arr);
+    return nullptr;
   }
+
+  if (loadError[0]) {
+    std::printf("Model compiled, but simulation warning:\n  %s\n", loadError);
+  }
+  return mnew;
+}
+
+void PhysicsLoop() {
+  // Elastic band is initialized in PhysicsThread after model is loaded.
+  // headless_sim::elastic_band_instance.enable_ = (config.enable_elastic_band
+  // == 1);
+
+  while (!exit_request.load()) {
+    std::this_thread::sleep_for(std::chrono::microseconds(100));
+
+    if (m && d) {
+      // Clear previous external forces (important if not set every step or if
+      // bridge also sets them) mju_zero(d->xfrc_applied, m->nbody * 6); //
+      // Optional: Clear if you want only band forces
+
+      if (config.ctrl_noise_std > 0.0 && m->nu > 0) {
+        mjtNum rate = mju_exp(-m->opt.timestep /
+                              mju_max(config.ctrl_noise_rate, mjMINVAL));
+        mjtNum scale = config.ctrl_noise_std * mju_sqrt(1 - rate * rate);
+        for (int i = 0; i < m->nu; i++) {
+          ctrlnoise[i] =
+              rate * ctrlnoise[i] + scale * mju_standardNormal(nullptr);
+          // Assuming noise is additive to any control signal from the bridge
+          // If bridge sets d->ctrl directly, this might overwrite or be
+          // overwritten. A common pattern is for bridge to set a target, and a
+          // low-level controller (or this noise) adds to it. Or, bridge writes
+          // to a separate buffer, and then it's combined with noise into
+          // d->ctrl. For now, directly setting d->ctrl with noise if no bridge
+          // input is assumed. If bridge provides input, it should be d->ctrl[i]
+          // = bridge_value[i] + ctrlnoise[i];
+          d->ctrl[i] = ctrlnoise[i];
+        }
+      }
+
+      if (config.enable_elastic_band == 1 &&
+          headless_sim::elastic_band_instance.enable_) {
+        headless_sim::elastic_band_instance.Advance(d); // Pass mjData
+        headless_sim::elastic_band_instance.ApplyForce(
+            d); // Apply the calculated force
+      }
+
+      mj_step(m, d);
+    } else {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  }
+  std::cout << "PhysicsLoop exiting." << std::endl;
+}
+} // namespace
+
+void PhysicsThread(const char *filename_arg) {
+  std::string scene_path_str;
+  const char *effective_filename = filename_arg;
+
+  if (filename_arg == nullptr || filename_arg[0] == '\0') {
+    scene_path_str =
+        "../../unitree_robots/" + config.robot + "/" + config.robot_scene;
+    effective_filename = scene_path_str.c_str();
+    std::cout << "No filename provided via argument, using from config: "
+              << effective_filename << std::endl;
+  } else {
+    std::cout << "Using filename from argument: " << effective_filename
+              << std::endl;
+  }
+
+  if (effective_filename != nullptr && effective_filename[0] != '\0') {
+    std::cout << "Loading model: " << effective_filename << std::endl;
+    m = LoadModel(effective_filename);
+    if (m) {
+      d = mj_makeData(m);
+    }
+
+    if (m && d) {
+      std::cout << "Model and data loaded successfully." << std::endl;
+      mj_forward(m, d);
+
+      if (ctrlnoise)
+        free(ctrlnoise);
+      if (m->nu > 0) { // Only allocate if there are controls
+        ctrlnoise = static_cast<mjtNum *>(malloc(sizeof(mjtNum) * m->nu));
+        mju_zero(ctrlnoise, m->nu);
+      } else {
+        ctrlnoise = nullptr;
+      }
+
+      // Initialize Elastic Band here, after model (m) is loaded
+      if (config.enable_elastic_band == 1) {
+        std::string target_body_name;
+        if (config.robot == "h1" || config.robot == "g1") {
+          target_body_name = "torso_link";
+        } else { // Default for go2, etc.
+          target_body_name = "base_link";
+        }
+        // Example equilibrium position (0,0,0) and stiffness/damping
+        // These could also come from config.yaml
+        double eq_pos[3] = {0.0, 0.0,
+                            0.5}; // Example: Target 0.5m height for base_link
+        headless_sim::elastic_band_instance.Init(true,   // enabled
+                                                 50.0,   // stiffness
+                                                 eq_pos, // equilibrium position
+                                                 5.0,    // damping
+                                                 m,      // mjModel pointer
+                                                 target_body_name);
+      }
+
+    } else {
+      std::cerr << "Failed to load model or make data from: "
+                << effective_filename << std::endl;
+      exit_request.store(true);
+    }
+  } else {
+    std::cerr << "No model filename specified." << std::endl;
+    exit_request.store(true);
+  }
+
+  if (!exit_request.load()) {
+    PhysicsLoop();
+  }
+
+  if (ctrlnoise) {
+    free(ctrlnoise);
+    ctrlnoise = nullptr;
+  }
+  if (d) {
+    mj_deleteData(d);
+    d = nullptr;
+  }
+  if (m) {
+    mj_deleteModel(m);
+    m = nullptr;
+  }
+  std::cout << "PhysicsThread finished cleanup." << std::endl;
+}
+
+void *UnitreeSdk2BridgeThread(void *arg) {
+  while (true) // Loop to check for exit request
+  {
+    if (exit_request.load()) {
+      std::cout
+          << "UnitreeSdk2BridgeThread: Exit request received during init wait."
+          << std::endl;
+      pthread_exit(NULL);
+    }
+    if (d && m) {
+      std::cout << "Mujoco data is prepared for Unitree SDK Bridge."
+                << std::endl;
+      break;
+    }
+    usleep(500000); // 0.5 seconds
+  }
+
+  // Ensure m and d are valid before proceeding
+  if (!m || !d) {
+    std::cerr << "UnitreeSdk2BridgeThread: m or d is null. Exiting."
+              << std::endl;
+    pthread_exit(NULL);
+  }
+
+  // Elastic band related config.band_attached_link is now handled internally by
+  // ElasticBand instance
 
   ChannelFactory::Instance()->Init(config.domain_id, config.interface);
   UnitreeSdk2Bridge unitree_interface(m, d);
 
-  if (config.use_joystick == 1)
-  {
-    unitree_interface.SetupJoystick(config.joystick_device, config.joystick_type, config.joystick_bits);
+  if (config.use_joystick == 1) {
+    unitree_interface.SetupJoystick(config.joystick_device,
+                                    config.joystick_type, config.joystick_bits);
   }
 
-  if (config.print_scene_information == 1)
-  {
+  if (config.print_scene_information == 1) {
     unitree_interface.PrintSceneInformation();
   }
 
+  std::cout << "UnitreeSdk2BridgeThread: Starting Run()." << std::endl;
+  // Modify UnitreeSdk2Bridge::Run() to be non-blocking or to periodically check
+  // an exit flag For now, assuming it might block. If so, exit_request won't
+  // stop it gracefully. A simple way if Run() is a loop: pass 'exit_request' to
+  // it or make it a member. while(!exit_request.load()) {
+  // unitree_interface.DoWork(); }
   unitree_interface.Run();
+  std::cout << "UnitreeSdk2BridgeThread: Run() finished." << std::endl;
 
   pthread_exit(NULL);
 }
-//------------------------------------------ main --------------------------------------------------
 
-// machinery for replacing command line error by a macOS dialog box when running under Rosetta
 #if defined(__APPLE__) && defined(__AVX__)
 extern void DisplayErrorDialogBox(const char *title, const char *msg);
 static const char *rosetta_error_msg = nullptr;
-__attribute__((used, visibility("default"))) extern "C" void _mj_rosettaError(const char *msg)
-{
+__attribute__((used, visibility("default"))) extern "C" void
+_mj_rosettaError(const char *msg) {
   rosetta_error_msg = msg;
 }
 #endif
 
-// run event loop
-int main(int argc, char **argv)
-{
-
-  // display an error if running on macOS under Rosetta 2
+int main(int argc, char **argv) {
 #if defined(__APPLE__) && defined(__AVX__)
-  if (rosetta_error_msg)
-  {
+  if (rosetta_error_msg) {
     DisplayErrorDialogBox("Rosetta 2 is not supported", rosetta_error_msg);
     std::exit(1);
   }
 #endif
 
-  // print version, check compatibility
   std::printf("MuJoCo version %s\n", mj_versionString());
-  if (mjVERSION_HEADER != mj_version())
-  {
+  if (mjVERSION_HEADER != mj_version()) {
     mju_error("Headers and library have different versions");
   }
 
-  // scan for libraries in the plugin directory to load additional plugins
   scanPluginLibraries();
 
-  mjvCamera cam;
-  mjv_defaultCamera(&cam);
+  YAML::Node yaml_node;
+  std::string config_file_path = "../config.yaml"; // Default path
+  // Potentially allow config file path to be an argument in the future
+  try {
+    yaml_node = YAML::LoadFile(config_file_path);
+    config.robot = yaml_node["robot"].as<std::string>(config.robot);
+    config.robot_scene =
+        yaml_node["robot_scene"].as<std::string>(config.robot_scene);
+    config.domain_id = yaml_node["domain_id"].as<int>(config.domain_id);
+    config.interface = yaml_node["interface"].as<std::string>(config.interface);
+    config.print_scene_information =
+        yaml_node["print_scene_information"].as<int>(
+            config.print_scene_information);
+    config.enable_elastic_band =
+        yaml_node["enable_elastic_band"].as<int>(config.enable_elastic_band);
+    config.use_joystick =
+        yaml_node["use_joystick"].as<int>(config.use_joystick);
+    config.joystick_type =
+        yaml_node["joystick_type"].as<std::string>(config.joystick_type);
+    config.joystick_device =
+        yaml_node["joystick_device"].as<std::string>(config.joystick_device);
+    config.joystick_bits =
+        yaml_node["joystick_bits"].as<int>(config.joystick_bits);
 
-  mjvOption opt;
-  mjv_defaultOption(&opt);
+    if (yaml_node["ctrl_noise_std"]) {
+      config.ctrl_noise_std = yaml_node["ctrl_noise_std"].as<double>();
+    }
+    if (yaml_node["ctrl_noise_rate"]) {
+      config.ctrl_noise_rate = yaml_node["ctrl_noise_rate"].as<double>();
+    }
+    std::cout << "Loaded configuration from " << config_file_path << std::endl;
 
-  mjvPerturb pert;
-  mjv_defaultPerturb(&pert);
-
-  // simulate object encapsulates the UI
-  auto sim = std::make_unique<mj::Simulate>(
-      std::make_unique<mj::GlfwAdapter>(),
-      &cam, &opt, &pert, /* is_passive = */ false);
-
-  // Load simulation configuration
-  YAML::Node yaml_node = YAML::LoadFile("../config.yaml");
-  config.robot = yaml_node["robot"].as<std::string>();
-  config.robot_scene = yaml_node["robot_scene"].as<std::string>();
-  config.domain_id = yaml_node["domain_id"].as<int>();
-  config.interface = yaml_node["interface"].as<std::string>();
-  config.print_scene_information = yaml_node["print_scene_information"].as<int>();
-  config.enable_elastic_band = yaml_node["enable_elastic_band"].as<int>();
-  config.use_joystick = yaml_node["use_joystick"].as<int>();
-  config.joystick_type = yaml_node["joystick_type"].as<std::string>();
-  config.joystick_device = yaml_node["joystick_device"].as<std::string>();
-  config.joystick_bits = yaml_node["joystick_bits"].as<int>();
-
-  sim->use_elastic_band_ = config.enable_elastic_band;
-  yaml_node.~Node();
-
-  string scene_path = "../../unitree_robots/" + config.robot + "/" + config.robot_scene;
-  const char *filename = nullptr;
-  if (argc > 1)
-  {
-    filename = argv[1];
-  }
-  else
-  {
-    filename = scene_path.c_str();
+  } catch (const YAML::Exception &e) {
+    std::cerr << "Warning: Error loading or parsing " << config_file_path
+              << ": " << e.what() << std::endl;
+    std::cerr << "Using default/hardcoded configuration values." << std::endl;
   }
 
-  pthread_t unitree_thread;
-  int rc = pthread_create(&unitree_thread, NULL, UnitreeSdk2BridgeThread, NULL);
-  if (rc != 0)
-  {
-    std::cout << "Error:unable to create thread," << rc << std::endl;
-    exit(-1);
+  const char *filename_main_arg = nullptr;
+  if (argc > 1) {
+    filename_main_arg = argv[1];
   }
 
-  // start physics thread
-  std::thread physicsthreadhandle(&PhysicsThread, sim.get(), filename);
-  // start simulation UI loop (blocking call)
-  sim->RenderLoop();
-  physicsthreadhandle.join();
+  pthread_t unitree_thread_handle;
+  int rc = pthread_create(&unitree_thread_handle, NULL, UnitreeSdk2BridgeThread,
+                          NULL);
+  if (rc != 0) {
+    std::cerr << "Error: unable to create unitree_thread, rc: " << rc
+              << std::endl;
+    // No need to exit(-1) immediately, try to start physics thread anyway or
+    // handle more gracefully. For now, we'll let it proceed and potentially
+    // fail later if bridge is critical.
+  }
 
-  pthread_exit(NULL);
+  std::cout << "Starting Physics Thread..." << std::endl;
+  std::thread physicsthreadhandle(&PhysicsThread, filename_main_arg);
+
+  std::cout << "Simulation running headlessly. Press Ctrl+C to interrupt."
+            << std::endl;
+
+  // Main thread will now wait for physics thread to complete.
+  // Physics thread will complete when exit_request is true.
+  if (physicsthreadhandle.joinable()) {
+    physicsthreadhandle.join();
+  }
+  std::cout << "Physics thread joined." << std::endl;
+
+  // Ensure exit_request is set for the Unitree bridge thread if it wasn't
+  // already
+  exit_request.store(true);
+  std::cout << "Requesting Unitree SDK Bridge thread to exit (if not already "
+               "signaled)..."
+            << std::endl;
+
+  if (rc == 0) { // Only try to join if pthread_create succeeded
+    // Give the Unitree thread a moment to react to exit_request before trying
+    // to join. This is a HACK. UnitreeSdk2Bridge.Run() should be designed to be
+    // interruptible. If it's a tight loop, it might not see exit_request in
+    // time for pthread_join. A timed join (pthread_timedjoin_np) or making
+    // Run() check exit_request frequently is better.
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    int join_rc = pthread_join(unitree_thread_handle, NULL);
+    if (join_rc != 0) {
+      std::cerr << "Error joining Unitree SDK Bridge thread, rc: " << join_rc
+                << ". It might be stuck." << std::endl;
+    } else {
+      std::cout << "Unitree SDK Bridge thread joined." << std::endl;
+    }
+  }
+
+  std::cout << "Exiting main." << std::endl;
   return 0;
 }
