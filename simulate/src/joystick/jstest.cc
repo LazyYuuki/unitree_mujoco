@@ -1,17 +1,16 @@
-#include <unistd.h>
+#include "joystick.h"
+#include <cstdint>
 #include <iostream>
 #include <map>
-#include "joystick.h"
+#include <unistd.h>
 
 #define GAMEPAD_TYPE 1 // 1: XBOX, 0: SWITCH
 #define MAX_AXES_VALUE 32768
 #define MIN_AXES_VALUE -32768
 using namespace std;
 
-typedef union
-{
-  struct
-  {
+typedef union {
+  struct {
     uint8_t R1 : 1;
     uint8_t L1 : 1;
     uint8_t start : 1;
@@ -32,45 +31,34 @@ typedef union
   uint16_t value;
 } xKeySwitchUnion;
 
-int main(int argc, char **argv)
-{
+int main(int argc, char **argv) {
   // Create an instance of Joystick
   Joystick joystick("/dev/input/js0");
 
   // Ensure that it was found and that we can use it
-  if (!joystick.isFound())
-  {
+  if (!joystick.isFound()) {
     printf("open failed.\n");
     exit(1);
   }
 
   xKeySwitchUnion unitree_key;
-  map<string, int> AxisId =
-      {
-          {"LX", 0}, // Left stick axis x
-          {"LY", 1}, // Left stick axis y
-          {"RX", 3}, // Right stick axis x
-          {"RY", 4}, // Right stick axis y
-          {"LT", 2}, // Left trigger
-          {"RT", 5}, // Right trigger
-          {"DX", 6}, // Directional pad x
-          {"DY", 7}, // Directional pad y
-      };
+  map<string, int> AxisId = {
+      {"LX", 0}, // Left stick axis x
+      {"LY", 1}, // Left stick axis y
+      {"RX", 3}, // Right stick axis x
+      {"RY", 4}, // Right stick axis y
+      {"LT", 2}, // Left trigger
+      {"RT", 5}, // Right trigger
+      {"DX", 6}, // Directional pad x
+      {"DY", 7}, // Directional pad y
+  };
 
-  map<string, int> ButtonId =
-      {
-          {"X", 2},
-          {"Y", 3},
-          {"B", 1},
-          {"A", 0},
-          {"LB", 4},
-          {"RB", 5},
-          {"SELECT", 6},
-          {"START", 7},
-      };
+  map<string, int> ButtonId = {
+      {"X", 2},  {"Y", 3},  {"B", 1},      {"A", 0},
+      {"LB", 4}, {"RB", 5}, {"SELECT", 6}, {"START", 7},
+  };
 
-  while (true)
-  {
+  while (true) {
 
     // Attempt to sample an event from the joystick
     joystick.getState();
